@@ -1,6 +1,7 @@
 package dev.langchain4j.store.embedding.redis;
 
 import redis.clients.jedis.search.schemafields.SchemaField;
+import redis.clients.jedis.search.schemafields.TagField;
 import redis.clients.jedis.search.schemafields.TextField;
 import redis.clients.jedis.search.schemafields.VectorField;
 import redis.clients.jedis.search.schemafields.VectorField.VectorAlgorithm;
@@ -62,7 +63,7 @@ class RedisSchema {
 
         if (metadataKeys != null) {
             for (String metadataKey : metadataKeys) {
-                fields.add(TextField.of(JSON_PATH_PREFIX + metadataKey).as(metadataKey).weight(1.0));
+                fields.add(TagField.of(JSON_PATH_PREFIX + metadataKey).as(metadataKey));
             }
         }
         return fields.toArray(new SchemaField[0]);

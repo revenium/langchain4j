@@ -6,6 +6,8 @@ import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
+import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
+import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +16,6 @@ import redis.clients.jedis.Pipeline;
 import redis.clients.jedis.json.Path2;
 import redis.clients.jedis.search.*;
 
-import java.io.IOException;
 import java.util.*;
 
 import static dev.langchain4j.internal.Utils.*;
@@ -70,7 +71,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                 .build();
 
         if (!isIndexExist(schema.indexName())) {
-            createIndex(schema.indexName());
+            createIndex(schema);
         }
     }
 
@@ -112,6 +113,32 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
     }
 
     @Override
+    public EmbeddingSearchResult<TextSegment> search(EmbeddingSearchRequest request) {
+        String queryTemplate = " =>[ KNN %d @%s $BLOB AS %s ]";
+        List<String> returnFields = new ArrayList<>(schema.metadataKeys());
+        returnFields.addAll(asList(schema.vectorFieldName(), schema.scalarFieldName(), SCORE_FIELD_NAME));
+
+        String formattedQuery;
+
+        if (request.filter() != null) {
+            formattedQuery = parseFilterToRedisExpression(request.filter().toString()) +
+                    format(queryTemplate, request.maxResults(), schema.vectorFieldName(), SCORE_FIELD_NAME);
+        } else {
+            formattedQuery = "*" + format(queryTemplate, request.maxResults(), schema.vectorFieldName(), SCORE_FIELD_NAME);
+        }
+
+        Query query = new Query(formattedQuery)
+                .addParam("BLOB", ToByteArray(request.queryEmbedding().vector()))
+                .returnFields(returnFields.toArray(new String[0]))
+                .setSortBy(SCORE_FIELD_NAME, true)
+                .dialect(2);
+
+        SearchResult result = client.ftSearch(schema.indexName(), query);
+        List<Document> documents = result.getDocuments();
+        return new EmbeddingSearchResult<>(toEmbeddingMatch(documents, request.minScore()));
+    }
+
+    @Override
     public List<EmbeddingMatch<TextSegment>> findRelevant(Embedding referenceEmbedding, int maxResults, double minScore) {
         // Using KNN query on @vector field
         String queryTemplate = "*=>[ KNN %d @%s $BLOB AS %s ]";
@@ -129,7 +156,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         return toEmbeddingMatch(documents, minScore);
     }
 
-    private void createIndex(String indexName) {
+    private void createIndex(RedisSchema redisSchema) {
+        String indexName = redisSchema.indexName();
         IndexDefinition indexDefinition = new IndexDefinition(JSON);
         indexDefinition.setPrefixes(schema.prefix());
         String res = client.ftCreate(indexName, FTCreateParams.createParams()
@@ -307,4 +335,43 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
             return new RedisEmbeddingStore(host, port, user, password, indexName, dimension, metadataKeys);
         }
     }
+
+    public String parseFilterToRedisExpression(String filterString) {
+
+        if (!filterString.startsWith("IsEqualTo")) {
+            throw new IllegalArgumentException("Unsupported filter operation");
+        }
+
+        int start = filterString.indexOf('(');
+        int end = filterString.lastIndexOf(')');
+        if (start == -1 || end == -1) {
+            throw new IllegalArgumentException("Invalid filter format: missing parentheses");
+        }
+
+        // Get the key-value pairs
+        String[] pairs = filterString.substring(start + 1, end).split(",");
+        String fieldName = null;
+        String value = null;
+
+        for (String pair : pairs) {
+            String[] keyValue = pair.trim().split("=");
+            if (keyValue.length != 2) {
+                throw new IllegalArgumentException("Invalid key-value pair: " + pair);
+            }
+
+            if (keyValue[0].equals("key")) {
+                // Remove the "$." prefix from the field name
+                fieldName = keyValue[1];
+            } else if (keyValue[0].equals("comparisonValue")) {
+                value = keyValue[1];
+            }
+        }
+
+        if (fieldName == null || value == null) {
+            throw new IllegalArgumentException("Missing required fields in filter");
+        }
+
+        return String.format("(@%s:{%s})", fieldName, value);
+    }
 }
+
