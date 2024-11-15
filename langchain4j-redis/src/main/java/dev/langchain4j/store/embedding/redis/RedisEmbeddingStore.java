@@ -11,8 +11,7 @@ import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import redis.clients.jedis.JedisPooled;
-import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.*;
 import redis.clients.jedis.json.Path2;
 import redis.clients.jedis.search.*;
 
@@ -38,7 +37,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
     private static final Logger log = LoggerFactory.getLogger(RedisEmbeddingStore.class);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
-    private final JedisPooled client;
+    private JedisPooled pooledClient = null;
+    private JedisCluster clusterClient = null;
     private final RedisSchema schema;
 
     /**
@@ -58,20 +58,44 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                                String password,
                                String indexName,
                                Integer dimension,
-                               Collection<String> metadataKeys) {
+                               Collection<String> metadataKeys,
+                               Boolean isCluster
+    ) {
         ensureNotBlank(host, "host");
         ensureNotNull(port, "port");
         ensureNotNull(dimension, "dimension");
 
-        this.client = user == null ? new JedisPooled(host, port) : new JedisPooled(host, port, user, password);
-        this.schema = RedisSchema.builder()
-                .indexName(getOrDefault(indexName, "embedding-index"))
-                .dimension(dimension)
-                .metadataKeys(metadataKeys)
-                .build();
+        try {
+            log.info("Creating RedisEmbeddingStore with host={}, port={}, user={}, indexName={}, dimension={}, metadataKeys={}",
+                    host, port, user, indexName, dimension, metadataKeys);
 
-        if (!isIndexExist(schema.indexName())) {
-            createIndex(schema);
+            if (isCluster == null || !isCluster) {
+                this.pooledClient = user == null ? new JedisPooled(host, port) : new JedisPooled(host, port, user, password);
+            } else {
+                JedisClientConfig jedisClientConfig = DefaultJedisClientConfig.builder().clientName("langchain4j")
+                        .timeoutMillis(20_000).connectionTimeoutMillis(30_000)
+                        .blockingSocketTimeoutMillis(0)
+                        .socketTimeoutMillis(60_000)
+                        .ssl(true).user(user).password(password).build();
+                Set<HostAndPort> hostAndPortSet = new HashSet<>();
+                hostAndPortSet.add(new HostAndPort(host, port));
+
+                this.clusterClient = new JedisCluster(hostAndPortSet, jedisClientConfig, 2);
+            }
+
+            // this.client = new JedisCluster(nodes, clientConfig);
+
+            this.schema = RedisSchema.builder()
+                    .indexName(getOrDefault(indexName, "embedding-index"))
+                    .dimension(dimension)
+                    .metadataKeys(metadataKeys)
+                    .build();
+
+            if (!isIndexExist(schema.indexName())) {
+                createIndex(schema);
+            }
+        } catch (Exception e) {
+            throw new RedisRequestFailedException("failed to create RedisEmbeddingStore", e);
         }
     }
 
@@ -133,7 +157,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                 .setSortBy(SCORE_FIELD_NAME, true)
                 .dialect(2);
 
-        SearchResult result = client.ftSearch(schema.indexName(), query);
+        SearchResult result = getSearchResult(query);
         List<Document> documents = result.getDocuments();
         return new EmbeddingSearchResult<>(toEmbeddingMatch(documents, request.minScore()));
     }
@@ -150,19 +174,39 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                 .setSortBy(SCORE_FIELD_NAME, true)
                 .dialect(2);
 
-        SearchResult result = client.ftSearch(schema.indexName(), query);
+        SearchResult result = getSearchResult(query);
+
         List<Document> documents = result.getDocuments();
 
         return toEmbeddingMatch(documents, minScore);
+    }
+
+    private SearchResult getSearchResult(Query query) {
+        SearchResult result ;
+
+        if (clusterClient != null) {
+            result = clusterClient.ftSearch(schema.indexName(), query);
+        } else {
+            result = pooledClient.ftSearch(schema.indexName(), query);
+        }
+        return result;
     }
 
     private void createIndex(RedisSchema redisSchema) {
         String indexName = redisSchema.indexName();
         IndexDefinition indexDefinition = new IndexDefinition(JSON);
         indexDefinition.setPrefixes(schema.prefix());
-        String res = client.ftCreate(indexName, FTCreateParams.createParams()
-                .on(IndexDataType.JSON)
-                .addPrefix(schema.prefix()), schema.toSchemaFields());
+
+        String res;
+        if (clusterClient != null) {
+            res = clusterClient.ftCreate(indexName, FTCreateParams.createParams()
+                    .on(IndexDataType.JSON)
+                    .addPrefix(schema.prefix()), schema.toSchemaFields());
+        } else {
+            res = pooledClient.ftCreate(indexName, FTCreateParams.createParams()
+                    .on(IndexDataType.JSON)
+                    .addPrefix(schema.prefix()), schema.toSchemaFields());
+        }
         if (!"OK".equals(res)) {
             if (log.isErrorEnabled()) {
                 log.error("create index error, msg={}", res);
@@ -172,7 +216,12 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
     }
 
     private boolean isIndexExist(String indexName) {
-        Set<String> indexes = client.ftList();
+        Set<String> indexes;
+        if (clusterClient != null) {
+            indexes = clusterClient.ftList();
+        } else {
+            indexes = pooledClient.ftList();
+        }
         return indexes.contains(indexName);
     }
 
@@ -189,7 +238,49 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         ensureTrue(embedded == null || embeddings.size() == embedded.size(), "embeddings size is not equal to embedded size");
 
         List<Object> responses;
-        try (Pipeline pipeline = client.pipelined()) {
+        if (clusterClient != null) {
+            responses = getClusteredResponses(ids, embeddings, embedded);
+        } else {
+            responses = getPooledResponses(ids, embeddings, embedded);
+        }
+
+        Optional<Object> errResponse = responses.stream().filter(response -> !"OK".equals(response)).findAny();
+        if (errResponse.isPresent()) {
+            if (log.isErrorEnabled()) {
+                log.error("add embedding failed, msg={}", errResponse.get());
+            }
+            throw new RedisRequestFailedException("add embedding failed, msg=" + errResponse.get());
+        }
+    }
+
+    private List<Object> getClusteredResponses(List<String> ids, List<Embedding> embeddings, List<TextSegment> embedded) {
+        List<Object> responses = new ArrayList<>();
+        try (ClusterPipeline pipeline = clusterClient.pipelined()) {
+
+            int size = ids.size();
+            for (int i = 0; i < size; i++) {
+                String id = ids.get(i);
+                Embedding embedding = embeddings.get(i);
+                TextSegment textSegment = embedded == null ? null : embedded.get(i);
+                Map<String, Object> fields = new HashMap<>();
+                fields.put(schema.vectorFieldName(), embedding.vector());
+                if (textSegment != null) {
+                    // do not check metadata key is included in RedisSchema#metadataKeys
+                    fields.put(schema.scalarFieldName(), textSegment.text());
+                    fields.putAll(textSegment.metadata().asMap());
+                }
+                String key = schema.prefix() + id;
+                responses.add(pipeline.jsonSetWithEscape(key, Path2.of("$"), fields));
+            }
+
+            pipeline.sync();
+        }
+        return responses;
+    }
+
+    private List<Object> getPooledResponses(List<String> ids, List<Embedding> embeddings, List<TextSegment> embedded) {
+        List<Object> responses;
+        try (Pipeline pipeline = pooledClient.pipelined()) {
 
             int size = ids.size();
             for (int i = 0; i < size; i++) {
@@ -209,14 +300,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
 
             responses = pipeline.syncAndReturnAll();
         }
-
-        Optional<Object> errResponse = responses.stream().filter(response -> !"OK".equals(response)).findAny();
-        if (errResponse.isPresent()) {
-            if (log.isErrorEnabled()) {
-                log.error("add embedding failed, msg={}", errResponse.get());
-            }
-            throw new RedisRequestFailedException("add embedding failed, msg=" + errResponse.get());
-        }
+        return responses;
     }
 
     private List<EmbeddingMatch<TextSegment>> toEmbeddingMatch(List<Document> documents, double minScore) {
@@ -262,6 +346,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         private String indexName;
         private Integer dimension;
         private Collection<String> metadataKeys = new ArrayList<>();
+        private Boolean isCluster = false;
 
         /**
          * @param host Redis Stack host
@@ -331,8 +416,16 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
             return this;
         }
 
+        /**
+         * @param isCluster whether to use Redis Cluster
+         */
+        public Builder isCluster(Boolean isCluster) {
+            this.isCluster = isCluster;
+            return this;
+        }
+
         public RedisEmbeddingStore build() {
-            return new RedisEmbeddingStore(host, port, user, password, indexName, dimension, metadataKeys);
+            return new RedisEmbeddingStore(host, port, user, password, indexName, dimension, metadataKeys, isCluster);
         }
     }
 

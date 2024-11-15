@@ -11,7 +11,7 @@
         <relativePath>../langchain4j-parent/pom.xml</relativePath>
     </parent>
 
-    <artifactId>langchain4j-redis</artifactId>
+    <artifactId>langchain4j-redis-revenium</artifactId>
     <name>LangChain4j :: Integration :: Redis</name>
 
     <dependencies>
