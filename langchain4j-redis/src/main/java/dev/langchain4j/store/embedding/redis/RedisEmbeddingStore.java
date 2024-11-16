@@ -83,8 +83,6 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                 this.clusterClient = new JedisCluster(hostAndPortSet, jedisClientConfig, 2);
             }
 
-            // this.client = new JedisCluster(nodes, clientConfig);
-
             this.schema = RedisSchema.builder()
                     .indexName(getOrDefault(indexName, "embedding-index"))
                     .dimension(dimension)
@@ -199,9 +197,14 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         String res;
         if (clusterClient != null) {
-            res = clusterClient.ftCreate(indexName, FTCreateParams.createParams()
-                    .on(IndexDataType.JSON)
-                    .addPrefix(schema.prefix()), schema.toSchemaFields());
+            try {
+                res = clusterClient.ftCreate(indexName, FTCreateParams.createParams()
+                        .on(IndexDataType.JSON)
+                        .addPrefix(schema.prefix()), schema.toSchemaFields());
+            } catch (Exception e) {
+                log.warn("create index error, msg={}", e.getMessage(), e);
+                res = e.getMessage();
+            }
         } else {
             res = pooledClient.ftCreate(indexName, FTCreateParams.createParams()
                     .on(IndexDataType.JSON)
@@ -213,6 +216,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
             }
             throw new RedisRequestFailedException("create index error, msg=" + res);
         }
+
     }
 
     private boolean isIndexExist(String indexName) {
@@ -244,7 +248,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
             responses = getPooledResponses(ids, embeddings, embedded);
         }
 
-        Optional<Object> errResponse = responses.stream().filter(response -> !"OK".equals(response)).findAny();
+        Optional<Object> errResponse = responses.stream().filter(response -> !"OK".equals(response))
+                .filter(response -> !response.toString().contains("Response String")).findAny();
         if (errResponse.isPresent()) {
             if (log.isErrorEnabled()) {
                 log.error("add embedding failed, msg={}", errResponse.get());
@@ -269,13 +274,22 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                     fields.put(schema.scalarFieldName(), textSegment.text());
                     fields.putAll(textSegment.metadata().asMap());
                 }
-                String key = schema.prefix() + id;
+                // ToDo 911 stop hardcoding the prefix
+                String key = String.format("{%s}:%s","embedding", id);
                 responses.add(pipeline.jsonSetWithEscape(key, Path2.of("$"), fields));
             }
 
             pipeline.sync();
         }
         return responses;
+    }
+
+    private String formatPrefix(String prefix) {
+        if (clusterClient != null) {
+            return "{" + prefix + "}";
+        } else {
+            return prefix;
+        }
     }
 
     private List<Object> getPooledResponses(List<String> ids, List<Embedding> embeddings, List<TextSegment> embedded) {
