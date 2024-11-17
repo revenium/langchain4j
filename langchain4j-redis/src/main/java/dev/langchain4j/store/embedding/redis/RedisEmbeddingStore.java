@@ -1,5 +1,6 @@
 package dev.langchain4j.store.embedding.redis;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.langchain4j.data.document.Metadata;
@@ -140,6 +141,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         List<String> returnFields = new ArrayList<>(schema.metadataKeys());
         returnFields.addAll(asList(schema.vectorFieldName(), schema.scalarFieldName(), SCORE_FIELD_NAME));
 
+        log.info("returnFields={}", returnFields);
+
         String formattedQuery;
 
         if (request.filter() != null) {
@@ -149,6 +152,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
             formattedQuery = "*" + format(queryTemplate, request.maxResults(), schema.vectorFieldName(), SCORE_FIELD_NAME);
         }
 
+        log.info("formattedQuery={}", formattedQuery);
+
         Query query = new Query(formattedQuery)
                 .addParam("BLOB", ToByteArray(request.queryEmbedding().vector()))
                 .returnFields(returnFields.toArray(new String[0]))
@@ -157,6 +162,8 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
 
         SearchResult result = getSearchResult(query);
         List<Document> documents = result.getDocuments();
+        log.info("search result document size: {}", documents.size());
+
         return new EmbeddingSearchResult<>(toEmbeddingMatch(documents, request.minScore()));
     }
 
@@ -180,9 +187,10 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
     }
 
     private SearchResult getSearchResult(Query query) {
-        SearchResult result ;
+        SearchResult result;
 
         if (clusterClient != null) {
+            log.info("Searching={} in index: {}", query, schema.indexName());
             result = clusterClient.ftSearch(schema.indexName(), query);
         } else {
             result = pooledClient.ftSearch(schema.indexName(), query);
@@ -193,16 +201,17 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
     private void createIndex(RedisSchema redisSchema) {
         String indexName = redisSchema.indexName();
         IndexDefinition indexDefinition = new IndexDefinition(JSON);
-        indexDefinition.setPrefixes(schema.prefix());
+        indexDefinition.setPrefixes(formatPrefix(schema.prefix()));
 
         String res;
         if (clusterClient != null) {
             try {
+                String formattedPrefix = formatPrefix(schema.prefix());
+                log.debug("Creating index: {} with prefix: {}", indexName, formattedPrefix);
                 res = clusterClient.ftCreate(indexName, FTCreateParams.createParams()
-                        .on(IndexDataType.JSON)
-                        .addPrefix(schema.prefix()), schema.toSchemaFields());
+                        .on(IndexDataType.JSON).addPrefix(formattedPrefix), schema.toSchemaFields());
             } catch (Exception e) {
-                log.warn("create index error, msg={}", e.getMessage(), e);
+                log.warn("create index error, msg={}", e.getMessage());
                 res = e.getMessage();
             }
         } else {
@@ -210,7 +219,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                     .on(IndexDataType.JSON)
                     .addPrefix(schema.prefix()), schema.toSchemaFields());
         }
-        if (!"OK".equals(res)) {
+        if (!"OK".equals(res) && !res.contains("broadcasting")) {
             if (log.isErrorEnabled()) {
                 log.error("create index error, msg={}", res);
             }
@@ -275,7 +284,9 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                     fields.putAll(textSegment.metadata().asMap());
                 }
                 // ToDo 911 stop hardcoding the prefix
-                String key = String.format("{%s}:%s","embedding", id);
+                String key = String.format("{%s}:%s", "embedding", id);
+
+                log.info("Saving key: {} with fields: {}", key, fields.keySet());
                 responses.add(pipeline.jsonSetWithEscape(key, Path2.of("$"), fields));
             }
 
@@ -284,9 +295,22 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         return responses;
     }
 
+    String extractId(String input) {
+        if (input.contains(":")) {
+            String[] parts = input.split(":");
+            return parts[parts.length - 1];
+        }
+        return input;
+    }
+
     private String formatPrefix(String prefix) {
         if (clusterClient != null) {
-            return "{" + prefix + "}";
+            if (prefix.endsWith(":")) {
+                String key = prefix.substring(0, prefix.length() - 1);
+                return "{" + key + "}:";
+            } else {
+                return "{" + prefix + "}:";
+            }
         } else {
             return prefix;
         }
@@ -325,20 +349,41 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
         return documents.stream()
                 .map(document -> {
                     double score = (2 - Double.parseDouble(document.getString(SCORE_FIELD_NAME))) / 2;
-                    String id = document.getId().substring(schema.prefix().length());
+                    String id = extractId(document.getId());
+                    log.info("document={}", document);
+                    log.info("document id={}", id);
+                    log.info("scalarFieldName={}", schema.scalarFieldName());
                     String text = document.hasProperty(schema.scalarFieldName()) ? document.getString(schema.scalarFieldName()) : null;
                     TextSegment embedded = null;
                     if (text != null) {
                         Map<String, String> metadata = schema.metadataKeys().stream()
                                 .filter(document::hasProperty)
                                 .collect(toMap(metadataKey -> metadataKey, document::getString));
+                        log.info("metadata={}", metadata);
                         embedded = new TextSegment(text, new Metadata(metadata));
                     }
                     Embedding embedding;
                     try {
-                        float[] vectors = OBJECT_MAPPER.readValue(document.getString(schema.vectorFieldName()), float[].class);
+                        log.info("vectorFieldName={}", schema.vectorFieldName());
+                        log.info("parsed document={}", document.get(schema.vectorFieldName()));
+                        document.getProperties().forEach((key) -> log.info("Property name: {}", key));
+
+                        float[] vectors;
+                        String vectorFieldName = schema.vectorFieldName();
+                        if (!document.hasProperty(vectorFieldName)) {
+                            log.warn("Vector field name: {} is null, trying MemoryDB format", vectorFieldName);
+                            try (JsonParser parser = OBJECT_MAPPER.readTree(document.getString("$"))
+                                    .get(0)
+                                    .get("vector")
+                                    .traverse(OBJECT_MAPPER)) {
+                                vectors = parser.readValueAs(float[].class);
+                            }
+                        } else {
+                            vectors = OBJECT_MAPPER.readValue(document.getString(vectorFieldName),
+                                    float[].class);
+                        }
                         embedding = new Embedding(vectors);
-                    } catch (JsonProcessingException e) {
+                    } catch (Exception e) {
                         throw new RedisRequestFailedException("failed to parse embedding", e);
                     }
                     return new EmbeddingMatch<>(score, id, embedding, embedded);
