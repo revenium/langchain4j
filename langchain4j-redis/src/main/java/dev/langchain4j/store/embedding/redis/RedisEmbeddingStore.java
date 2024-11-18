@@ -283,8 +283,7 @@ public class RedisEmbeddingStore implements EmbeddingStore<TextSegment> {
                     fields.put(schema.scalarFieldName(), textSegment.text());
                     fields.putAll(textSegment.metadata().asMap());
                 }
-                // ToDo 911 stop hardcoding the prefix
-                String key = String.format("{%s}:%s", "embedding", id);
+                String key = String.format("%s%s", formatPrefix(schema.prefix()), id);
 
                 log.info("Saving key: {} with fields: {}", key, fields.keySet());
                 responses.add(pipeline.jsonSetWithEscape(key, Path2.of("$"), fields));
